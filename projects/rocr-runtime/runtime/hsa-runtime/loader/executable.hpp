@@ -367,11 +367,18 @@ private:
 
   const void *elf_data;
   const size_t elf_size;
+  std::vector<uint8_t> owned_elf_storage;
   std::vector<Segment*> loaded_segments;
 
 public:
   LoadedCodeObjectImpl(ExecutableImpl *owner_, hsa_agent_t agent_, const void *elf_data_, size_t elf_size_)
     : ExecutableObject(owner_, agent_), elf_data(elf_data_), elf_size(elf_size_) {
+      memset(&r_debug_info, 0, sizeof(r_debug_info));
+    }
+
+  LoadedCodeObjectImpl(ExecutableImpl *owner_, hsa_agent_t agent_, std::vector<uint8_t>&& elf_storage_)
+    : ExecutableObject(owner_, agent_), elf_data(elf_storage_.data()),
+      elf_size(elf_storage_.size()), owned_elf_storage(std::move(elf_storage_)) {
       memset(&r_debug_info, 0, sizeof(r_debug_info));
     }
 

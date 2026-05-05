@@ -299,8 +299,8 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
   void Resume();
 
   /// @brief Handle insufficient scratch
-  void HandleInsufficientScratch(hsa_signal_value_t& error_code, hsa_signal_value_t& waitVal,
-                                 bool& changeWait);
+  hsa_status_t HandleInsufficientScratch(hsa_signal_value_t& error_code,
+                                         hsa_signal_value_t& waitVal, bool& changeWait);
 
   /// @brief Handler for hardware queue events.
   template <bool HandleExceptions>

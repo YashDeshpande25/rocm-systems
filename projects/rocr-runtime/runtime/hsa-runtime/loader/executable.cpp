@@ -54,6 +54,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <atomic>
 #include <fstream>
 #include "inc/amd_hsa_elf.h"
@@ -66,6 +67,10 @@
 #include "executable.hpp"
 
 #include "AMDHSAKernelDescriptor.h"
+
+#ifdef ROCR_HOTSWAP_COMGR_ADAPTER
+#include "amd_comgr.h"
+#endif
 
 using namespace rocr::amd::hsa;
 using namespace rocr::amd::hsa::common;
@@ -174,6 +179,393 @@ void LoaderOptions::PrintHelp(std::ostream& out) const
 }
 
 static const char *LOADER_DUMP_PREFIX = "amdcode";
+
+#ifdef ROCR_HOTSWAP_COMGR_ADAPTER
+static std::string JsonEscape(const std::string& s) {
+  std::ostringstream os;
+  for (char c : s) {
+    switch (c) {
+      case '\\': os << "\\\\"; break;
+      case '"': os << "\\\""; break;
+      case '\n': os << "\\n"; break;
+      case '\r': os << "\\r"; break;
+      case '\t': os << "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          os << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+             << static_cast<unsigned>(static_cast<unsigned char>(c))
+             << std::dec << std::setfill(' ');
+        } else {
+          os << c;
+        }
+    }
+  }
+  return os.str();
+}
+
+static bool HotSwapEnvEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+static bool AppendHotSwapProofJson(const std::string& jsonFields) {
+  const char* path = std::getenv("HSA_HOTSWAP_PROOF_LOG");
+  if (!path || !path[0]) return true;
+  std::ofstream out(path, std::ios::app);
+  if (!out) {
+    std::cerr << "hotswap: failed to open proof log '" << path
+              << "' for append\n";
+    return false;
+  }
+  out << "{" << jsonFields << "}\n";
+  if (!out) {
+    std::cerr << "hotswap: failed to write proof log '" << path << "'\n";
+    return false;
+  }
+  return true;
+}
+
+static std::string ExtractGfxName(const std::string& isa) {
+  size_t pos = isa.rfind("gfx");
+  if (pos == std::string::npos) return "";
+  size_t end = pos + 3;
+  while (end < isa.size() &&
+         ((isa[end] >= '0' && isa[end] <= '9') ||
+          (isa[end] >= 'a' && isa[end] <= 'z'))) {
+    ++end;
+  }
+  return isa.substr(pos, end - pos);
+}
+
+static const char* LookupStatusString(
+    amd_comgr_hotswap_cache_lookup_status_t status) {
+  switch (status) {
+    case AMD_COMGR_HOTSWAP_CACHE_LOOKUP_DISABLED: return "disabled";
+    case AMD_COMGR_HOTSWAP_CACHE_LOOKUP_BYPASSED: return "bypassed";
+    case AMD_COMGR_HOTSWAP_CACHE_LOOKUP_MISS: return "miss";
+    case AMD_COMGR_HOTSWAP_CACHE_LOOKUP_HIT: return "hit";
+    case AMD_COMGR_HOTSWAP_CACHE_LOOKUP_INVALID: return "invalid";
+  }
+  return "invalid";
+}
+
+static const char* WriteStatusString(
+    amd_comgr_hotswap_cache_write_status_t status) {
+  switch (status) {
+    case AMD_COMGR_HOTSWAP_CACHE_WRITE_NOT_ATTEMPTED:
+      return "not_attempted";
+    case AMD_COMGR_HOTSWAP_CACHE_WRITE_SUCCESS:
+      return "success";
+    case AMD_COMGR_HOTSWAP_CACHE_WRITE_FAILED:
+      return "failed";
+  }
+  return "failed";
+}
+
+static bool GetComgrResultString(
+    amd_comgr_hotswap_transpile_result_t result,
+    amd_comgr_hotswap_transpile_result_string_t field,
+    std::string& out) {
+  size_t size = 0;
+  amd_comgr_status_t status =
+      amd_comgr_hotswap_transpile_result_get_string(result, field, &size,
+                                                    nullptr);
+  if (status != AMD_COMGR_STATUS_SUCCESS) return false;
+  out.assign(size, '\0');
+  status = amd_comgr_hotswap_transpile_result_get_string(result, field, &size,
+                                                         out.data());
+  if (status != AMD_COMGR_STATUS_SUCCESS) return false;
+  if (!out.empty() && out.back() == '\0') out.pop_back();
+  return true;
+}
+
+template <typename T>
+static bool GetComgrResultInfo(amd_comgr_hotswap_transpile_result_t result,
+                               amd_comgr_hotswap_transpile_result_info_t info,
+                               T& value) {
+  return amd_comgr_hotswap_transpile_result_get_info(result, info, &value) ==
+         AMD_COMGR_STATUS_SUCCESS;
+}
+
+static bool AppendHotSwapComgrProof(
+    const char* event, amd_comgr_hotswap_transpile_result_t result,
+    size_t elfSize = 0, const char* overrideFailReason = nullptr,
+    const char* overrideFailDetail = nullptr) {
+  bool success = false;
+  bool cacheHit = false;
+  int64_t lifted = 0;
+  int64_t total = 0;
+  amd_comgr_hotswap_cache_lookup_status_t lookupStatus =
+      AMD_COMGR_HOTSWAP_CACHE_LOOKUP_DISABLED;
+  amd_comgr_hotswap_cache_write_status_t writeStatus =
+      AMD_COMGR_HOTSWAP_CACHE_WRITE_NOT_ATTEMPTED;
+  std::string backend, sourceGfx, targetGfx, cacheKey, cacheDetail;
+  std::string cacheMetadata, cacheObject, failReason, failDetail;
+
+  if (!GetComgrResultInfo(result, AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_SUCCESS,
+                          success) ||
+      !GetComgrResultInfo(result, AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_HIT,
+                          cacheHit) ||
+      !GetComgrResultInfo(result,
+                          AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_LOOKUP,
+                          lookupStatus) ||
+      !GetComgrResultInfo(result,
+                          AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_WRITE,
+                          writeStatus) ||
+      !GetComgrResultInfo(result,
+                          AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_LIFTED_COUNT,
+                          lifted) ||
+      !GetComgrResultInfo(result,
+                          AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_TOTAL_COUNT,
+                          total) ||
+      !GetComgrResultString(result, AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_BACKEND,
+                            backend) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_SOURCE_GFX,
+                            sourceGfx) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_TARGET_GFX,
+                            targetGfx) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_KEY,
+                            cacheKey) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_DETAIL,
+                            cacheDetail) ||
+      !GetComgrResultString(
+          result, AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_METADATA_PATH,
+          cacheMetadata) ||
+      !GetComgrResultString(
+          result, AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_OBJECT_PATH,
+          cacheObject) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_FAIL_REASON,
+                            failReason) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_FAIL_DETAIL,
+                            failDetail)) {
+    std::cerr << "hotswap: failed to query COMGR result metadata\n";
+    return false;
+  }
+
+  if (overrideFailReason) {
+    success = false;
+    failReason = overrideFailReason;
+    failDetail = overrideFailDetail ? overrideFailDetail : "";
+  }
+
+  std::ostringstream proof;
+  proof << "\"event\":\"" << event << "\""
+        << ",\"backend\":\"" << JsonEscape(backend) << "\""
+        << ",\"source_gfx\":\"" << JsonEscape(sourceGfx) << "\""
+        << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\""
+        << ",\"success\":" << (success ? "true" : "false")
+        << ",\"cache_hit\":" << (cacheHit ? "true" : "false")
+        << ",\"cache_status\":\"" << LookupStatusString(lookupStatus) << "\""
+        << ",\"cache_lookup_status\":\"" << LookupStatusString(lookupStatus)
+        << "\""
+        << ",\"cache_write_status\":\"" << WriteStatusString(writeStatus)
+        << "\""
+        << ",\"lifted_count\":" << lifted
+        << ",\"total_count\":" << total;
+  if (elfSize > 0)
+    proof << ",\"elf_size\":" << elfSize;
+  if (!cacheKey.empty())
+    proof << ",\"cache_key\":\"" << JsonEscape(cacheKey) << "\"";
+  if (!cacheMetadata.empty())
+    proof << ",\"cache_metadata\":\"" << JsonEscape(cacheMetadata) << "\"";
+  if (!cacheObject.empty())
+    proof << ",\"cache_object\":\"" << JsonEscape(cacheObject) << "\"";
+  if (!cacheDetail.empty())
+    proof << ",\"cache_detail\":\"" << JsonEscape(cacheDetail) << "\"";
+  if (!failReason.empty())
+    proof << ",\"fail_reason\":\"" << JsonEscape(failReason) << "\"";
+  if (!failDetail.empty())
+    proof << ",\"fail_detail\":\"" << JsonEscape(failDetail) << "\"";
+  return AppendHotSwapProofJson(proof.str());
+}
+
+static void LogComgrCacheDebug(amd_comgr_hotswap_transpile_result_t result) {
+  const char* cacheDebug = std::getenv("HSA_HOTSWAP_CACHE_DEBUG");
+  if (!cacheDebug || !cacheDebug[0]) return;
+  amd_comgr_hotswap_cache_lookup_status_t lookupStatus =
+      AMD_COMGR_HOTSWAP_CACHE_LOOKUP_DISABLED;
+  std::string sourceGfx, targetGfx;
+  if (!GetComgrResultInfo(result,
+                          AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_LOOKUP,
+                          lookupStatus) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_SOURCE_GFX,
+                            sourceGfx) ||
+      !GetComgrResultString(result,
+                            AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_TARGET_GFX,
+                            targetGfx))
+    return;
+  std::cerr << "hotswap_cache: " << LookupStatusString(lookupStatus) << " ("
+            << sourceGfx << " -> " << targetGfx << ")\n";
+}
+
+static const char* GfxNameFromHotSwapMach(uint8_t mach) {
+  switch (mach) {
+    case 0x041: return "gfx1100";
+    case 0x042: return "gfx1101";
+    case 0x043: return "gfx1102";
+    case 0x044: return "gfx1103";
+    case 0x046: return "gfx1150";
+    case 0x047: return "gfx1151";
+    case 0x048: return "gfx1200";
+    case 0x049: return "gfx1250";
+    case 0x04a: return "gfx1151";
+    case 0x04c: return "gfx942";
+    case 0x04e: return "gfx1201";
+    case 0x04f: return "gfx950";
+    case 0x05a: return "gfx1251";
+    default: return nullptr;
+  }
+}
+
+static bool ReadHotSwapOriginalGfx(const void* elfData, size_t elfSize,
+                                   std::string& sourceGfx,
+                                   uint8_t& sourceMach) {
+  if (!elfData || elfSize < 12) return false;
+  const auto* bytes = reinterpret_cast<const uint8_t*>(elfData);
+  if (bytes[9] != 'S' || bytes[10] != 'L') return false;
+  const char* gfx = GfxNameFromHotSwapMach(bytes[11]);
+  if (!gfx) return false;
+  sourceMach = bytes[11];
+  sourceGfx = gfx;
+  return true;
+}
+
+static bool HotSwapMachFromGfxName(const std::string& gfx, uint32_t& mach) {
+  struct GfxMach {
+    const char* name;
+    uint32_t mach;
+  };
+  static const GfxMach kGfxMachMap[] = {
+      {"gfx900", 0x02c},  {"gfx902", 0x02d},  {"gfx904", 0x02e},
+      {"gfx906", 0x02f},  {"gfx908", 0x030},  {"gfx909", 0x031},
+      {"gfx90a", 0x03f},  {"gfx90c", 0x032},  {"gfx942", 0x04c},
+      {"gfx950", 0x04f},  {"gfx1010", 0x033}, {"gfx1011", 0x034},
+      {"gfx1012", 0x035}, {"gfx1030", 0x036}, {"gfx1031", 0x037},
+      {"gfx1032", 0x038}, {"gfx1033", 0x039}, {"gfx1034", 0x03e},
+      {"gfx1035", 0x03d}, {"gfx1100", 0x041}, {"gfx1101", 0x046},
+      {"gfx1102", 0x047}, {"gfx1103", 0x044}, {"gfx1150", 0x043},
+      {"gfx1151", 0x04a}, {"gfx1200", 0x048}, {"gfx1201", 0x04e},
+      {"gfx1250", 0x049}, {"gfx1251", 0x05a}, {nullptr, 0},
+  };
+  for (const GfxMach* entry = kGfxMachMap; entry->name; ++entry) {
+    if (gfx == entry->name) {
+      mach = entry->mach;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool PatchHotSwapCodeObjectIsa(void* elfData, size_t elfSize,
+                                      const char* targetIsa) {
+  if (!elfData || !targetIsa || elfSize < 64)
+    return false;
+  auto* elf = static_cast<uint8_t*>(elfData);
+  if (elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F')
+    return false;
+  if (elf[4] != 2)
+    return false;
+
+  const std::string targetGfx = ExtractGfxName(targetIsa);
+  uint32_t targetMach = 0;
+  if (targetGfx.empty() || !HotSwapMachFromGfxName(targetGfx, targetMach))
+    return false;
+
+  uint32_t eFlags = 0;
+  std::memcpy(&eFlags, elf + 48, sizeof(eFlags));
+  eFlags = (eFlags & ~0xffu) | (targetMach & 0xffu);
+  std::memcpy(elf + 48, &eFlags, sizeof(eFlags));
+
+  uint64_t eShoff = 0;
+  uint16_t eShentsize = 0;
+  uint16_t eShnum = 0;
+  std::memcpy(&eShoff, elf + 40, sizeof(eShoff));
+  std::memcpy(&eShentsize, elf + 58, sizeof(eShentsize));
+  std::memcpy(&eShnum, elf + 60, sizeof(eShnum));
+  if (eShoff == 0 || eShentsize == 0 || eShnum == 0)
+    return true;
+  if (eShoff + static_cast<uint64_t>(eShentsize) * eShnum > elfSize)
+    return false;
+
+  for (uint16_t i = 0; i < eShnum; ++i) {
+    const uint8_t* sh = elf + eShoff + static_cast<uint64_t>(i) * eShentsize;
+    uint32_t shType = 0;
+    std::memcpy(&shType, sh + 4, sizeof(shType));
+    if (shType != 7)
+      continue;
+
+    uint64_t shOffset = 0;
+    uint64_t shSize = 0;
+    std::memcpy(&shOffset, sh + 24, sizeof(shOffset));
+    std::memcpy(&shSize, sh + 32, sizeof(shSize));
+    if (shOffset + shSize > elfSize)
+      return false;
+
+    uint64_t pos = shOffset;
+    while (pos + 12 <= shOffset + shSize) {
+      uint32_t nameSize = 0;
+      uint32_t descSize = 0;
+      uint32_t type = 0;
+      std::memcpy(&nameSize, elf + pos, sizeof(nameSize));
+      std::memcpy(&descSize, elf + pos + 4, sizeof(descSize));
+      std::memcpy(&type, elf + pos + 8, sizeof(type));
+      const uint32_t nameSizeAligned = (nameSize + 3) & ~3u;
+      const uint32_t descSizeAligned = (descSize + 3) & ~3u;
+      const uint64_t noteTotal = 12 + nameSizeAligned + descSizeAligned;
+      if (pos + noteTotal > shOffset + shSize)
+        return false;
+
+      if (type == 27 && nameSize > 0) {
+        const char* owner = reinterpret_cast<const char*>(elf + pos + 12);
+        if (std::strncmp(owner, "AMDGPU", 6) == 0) {
+          uint8_t* desc = elf + pos + 12 + nameSizeAligned;
+          std::string isa(reinterpret_cast<const char*>(desc), descSize);
+          size_t gfxPos = isa.find("gfx");
+          if (gfxPos != std::string::npos) {
+            size_t gfxEnd = gfxPos;
+            while (gfxEnd < isa.size() && isa[gfxEnd] != ':' &&
+                   isa[gfxEnd] != '\0') {
+              ++gfxEnd;
+            }
+            const size_t originalLen = gfxEnd - gfxPos;
+            if (targetGfx.size() > originalLen)
+              return false;
+            std::memcpy(desc + gfxPos, targetGfx.c_str(), targetGfx.size());
+            for (size_t j = targetGfx.size(); j < originalLen; ++j)
+              desc[gfxPos + j] = '\0';
+          }
+        }
+      }
+      pos += noteTotal;
+    }
+  }
+  return true;
+}
+
+// Compatibility surface used by the existing HIP module-load intercept shim.
+// The shim owns EI_PAD marking; this function only retargets ELF-visible ISA
+// fields so the normal ROCR parser can accept the object before COMGR performs
+// the actual HotSwap translation.
+extern "C" __attribute__((visibility("default")))
+int rocr_hotswap_patch_elf(void* elf_data, size_t elf_size,
+                          const char* target_isa) {
+  return PatchHotSwapCodeObjectIsa(elf_data, elf_size, target_isa) ? 0 : -1;
+}
+
+// Backward-compatible symbol used by existing Salmon corpus intercept shims.
+extern "C" __attribute__((visibility("default")))
+int rocr_salmon_patch_elf(void* elf_data, size_t elf_size,
+                          const char* target_isa) {
+  return rocr_hotswap_patch_elf(elf_data, elf_size, target_isa);
+}
+#endif
 
 Loader* Loader::Create(Context* context)
 {
@@ -1283,6 +1675,201 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
     return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
   }
 
+#ifdef ROCR_HOTSWAP_COMGR_ADAPTER
+  std::vector<uint8_t> ownedCodeObject;
+  bool ownsCodeObject = false;
+  if (HotSwapEnvEnabled("HSA_HOTSWAP_IR_RAISER")) {
+    const char* overrideEnv = std::getenv("HSA_HOTSWAP_ISA_OVERRIDE");
+    std::string targetGfx;
+    if (overrideEnv && overrideEnv[0] && std::strcmp(overrideEnv, "0") != 0) {
+      targetGfx = std::strcmp(overrideEnv, "1") == 0
+                      ? ExtractGfxName(codeIsa)
+                      : ExtractGfxName(overrideEnv);
+      if (targetGfx.empty() && std::strncmp(overrideEnv, "gfx", 3) == 0)
+        targetGfx = overrideEnv;
+    }
+
+    if (!targetGfx.empty()) {
+      std::string sourceGfx;
+      uint8_t sourceMach = 0;
+      const bool markedForHotSwap =
+          ReadHotSwapOriginalGfx(code->ElfData(), code->ElfSize(), sourceGfx,
+                                 sourceMach);
+      const std::string codeGfx = ExtractGfxName(codeIsa);
+
+      if (!markedForHotSwap) {
+        if (!codeGfx.empty() && codeGfx != targetGfx) {
+          std::ostringstream proof;
+          proof << "\"event\":\"hotswap_skip\""
+                << ",\"backend\":\"comgr\""
+                << ",\"reason\":\"not_intercept_marked\""
+                << ",\"source_gfx\":\"" << JsonEscape(codeGfx) << "\""
+                << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\""
+                << ",\"elf_size\":" << code->ElfSize();
+          if (!AppendHotSwapProofJson(proof.str()))
+            return HSA_STATUS_ERROR;
+        }
+      } else if (sourceGfx != targetGfx) {
+        const std::string sourceIsa =
+            std::string("amdgcn-amd-amdhsa--") + sourceGfx;
+        const std::string targetIsa =
+            std::string("amdgcn-amd-amdhsa--") + targetGfx;
+
+        {
+          std::ostringstream proof;
+          proof << "\"event\":\"transpile_decision\""
+                << ",\"source\":\"loader_ei_pad\""
+                << ",\"source_gfx\":\"" << JsonEscape(sourceGfx) << "\""
+                << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\""
+                << ",\"orig_mach\":\"0x" << std::hex
+                << static_cast<unsigned>(sourceMach) << std::dec << "\""
+                << ",\"code_isa\":\"" << JsonEscape(codeIsa) << "\"";
+          if (!AppendHotSwapProofJson(proof.str()))
+            return HSA_STATUS_ERROR;
+        }
+
+        std::vector<uint8_t> comgrSource(
+            reinterpret_cast<const uint8_t*>(code->ElfData()),
+            reinterpret_cast<const uint8_t*>(code->ElfData()) + code->ElfSize());
+        if (comgrSource.size() > 48)
+          comgrSource[48] = sourceMach;
+
+        amd_comgr_data_t comgrInput = {0};
+        amd_comgr_status_t comgrStatus =
+            amd_comgr_create_data(AMD_COMGR_DATA_KIND_EXECUTABLE, &comgrInput);
+        if (comgrStatus != AMD_COMGR_STATUS_SUCCESS) {
+          logger_ << "LoaderError: COMGR failed to create HotSwap input data\n";
+          return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        }
+
+        comgrStatus = amd_comgr_set_data(
+            comgrInput, comgrSource.size(),
+            reinterpret_cast<const char*>(comgrSource.data()));
+        if (comgrStatus != AMD_COMGR_STATUS_SUCCESS) {
+          amd_comgr_release_data(comgrInput);
+          logger_ << "LoaderError: COMGR failed to set HotSwap input data\n";
+          return HSA_STATUS_ERROR;
+        }
+
+        amd_comgr_hotswap_transpile_options_t comgrOptions = {};
+        comgrOptions.size = sizeof(comgrOptions);
+        comgrOptions.cache_directory = std::getenv("HSA_HOTSWAP_CACHE_DIR");
+        comgrOptions.cache_skip_kernels =
+            std::getenv("HSA_HOTSWAP_CACHE_SKIP_KERNELS");
+        comgrOptions.hotswap_rules_path = std::getenv("HSA_HOTSWAP_RULES");
+        if (HotSwapEnvEnabled("HSA_HOTSWAP_CACHE_DISABLE"))
+          comgrOptions.flags |=
+              AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_CACHE_DISABLE;
+        if (HotSwapEnvEnabled("HSA_HOTSWAP_CACHE_READONLY"))
+          comgrOptions.flags |=
+              AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_CACHE_READONLY;
+        if (HotSwapEnvEnabled("HSA_HOTSWAP_STRICT"))
+          comgrOptions.flags |= AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_STRICT;
+
+        amd_comgr_data_t comgrOutput = {0};
+        amd_comgr_hotswap_transpile_result_t comgrResult = {0};
+        comgrStatus = amd_comgr_hotswap_transpile_with_options(
+            comgrInput, sourceIsa.c_str(), targetIsa.c_str(), &comgrOptions,
+            &comgrOutput, &comgrResult);
+        amd_comgr_release_data(comgrInput);
+
+        if (comgrResult.handle) {
+          if (!AppendHotSwapComgrProof("hotswap_cache", comgrResult)) {
+            if (comgrOutput.handle) amd_comgr_release_data(comgrOutput);
+            amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+            return HSA_STATUS_ERROR;
+          }
+          LogComgrCacheDebug(comgrResult);
+        }
+
+        if (comgrStatus != AMD_COMGR_STATUS_SUCCESS) {
+          logger_ << "LoaderError: COMGR HotSwap transpilation failed\n";
+          if (comgrResult.handle) {
+            if (!AppendHotSwapComgrProof("hotswap_result", comgrResult)) {
+              if (comgrOutput.handle) amd_comgr_release_data(comgrOutput);
+              amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+              return HSA_STATUS_ERROR;
+            }
+            amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+          }
+          if (comgrOutput.handle) amd_comgr_release_data(comgrOutput);
+          return HSA_STATUS_ERROR;
+        }
+
+        size_t comgrOutputSize = 0;
+        comgrStatus = amd_comgr_get_data(comgrOutput, &comgrOutputSize, nullptr);
+        if (comgrStatus != AMD_COMGR_STATUS_SUCCESS || comgrOutputSize == 0) {
+          amd_comgr_release_data(comgrOutput);
+          if (comgrResult.handle) {
+            if (!AppendHotSwapComgrProof(
+                    "hotswap_result", comgrResult, 0, "comgr_empty_output",
+                    "COMGR produced no translated HSACO bytes")) {
+              amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+              return HSA_STATUS_ERROR;
+            }
+            amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+          }
+          logger_ << "LoaderError: COMGR produced no translated HSACO bytes\n";
+          return HSA_STATUS_ERROR;
+        }
+
+        ownedCodeObject.assign(comgrOutputSize, 0);
+        comgrStatus = amd_comgr_get_data(
+            comgrOutput, &comgrOutputSize,
+            reinterpret_cast<char*>(ownedCodeObject.data()));
+        amd_comgr_release_data(comgrOutput);
+        if (comgrStatus != AMD_COMGR_STATUS_SUCCESS) {
+          if (comgrResult.handle) {
+            if (!AppendHotSwapComgrProof(
+                    "hotswap_result", comgrResult, 0, "comgr_read_output",
+                    "COMGR translated HSACO read failed")) {
+              amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+              return HSA_STATUS_ERROR;
+            }
+            amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+          }
+          logger_ << "LoaderError: failed to read COMGR translated HSACO\n";
+          return HSA_STATUS_ERROR;
+        }
+
+        code = std::make_unique<code::AmdHsaCode>();
+        if (!code->InitAsBuffer(ownedCodeObject.data(), ownedCodeObject.size())) {
+          if (comgrResult.handle) {
+            if (!AppendHotSwapComgrProof(
+                    "hotswap_result", comgrResult, ownedCodeObject.size(),
+                    "init_as_buffer_failed",
+                    "COMGR translated HSACO failed ROCR code object "
+                    "initialization")) {
+              amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+              return HSA_STATUS_ERROR;
+            }
+            amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+          }
+          logger_ << "LoaderError: COMGR translated HSACO failed to initialize\n";
+          return HSA_STATUS_ERROR;
+        }
+        ownsCodeObject = true;
+        if (!code->GetIsa(codeIsa, &genericVersion)) {
+          logger_ << "LoaderError: failed to determine translated code object's ISA\n";
+          return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+        }
+        if (!code->GetCodeObjectVersion(&majorVersion, &minorVersion)) {
+          logger_ << "LoaderError: failed to determine translated code object's version\n";
+          return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+        }
+        if (comgrResult.handle) {
+          if (!AppendHotSwapComgrProof("hotswap_result", comgrResult,
+                                       ownedCodeObject.size())) {
+            amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+            return HSA_STATUS_ERROR;
+          }
+          amd_comgr_destroy_hotswap_transpile_result(comgrResult);
+        }
+      }
+    }
+  }
+#endif
+
   hsa_isa_t objectsIsa = context_->IsaFromName(codeIsa.c_str());
   if (!objectsIsa.handle) {
     logger_ << "LoaderError: code object's ISA (" << codeIsa.c_str() << ") is invalid\n";
@@ -1296,7 +1883,16 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
 
   hsa_status_t status;
 
-  objects.push_back(std::make_shared<LoadedCodeObjectImpl>(this, agent, code->ElfData(), code->ElfSize()));
+#ifdef ROCR_HOTSWAP_COMGR_ADAPTER
+  if (ownsCodeObject) {
+    objects.push_back(std::make_shared<LoadedCodeObjectImpl>(
+        this, agent, std::move(ownedCodeObject)));
+  } else
+#endif
+  {
+    objects.push_back(std::make_shared<LoadedCodeObjectImpl>(
+        this, agent, code->ElfData(), code->ElfSize()));
+  }
   loaded_code_objects.push_back(std::static_pointer_cast<LoadedCodeObjectImpl>(objects.back()));
 
   status = LoadSegments(agent, code.get(), majorVersion);

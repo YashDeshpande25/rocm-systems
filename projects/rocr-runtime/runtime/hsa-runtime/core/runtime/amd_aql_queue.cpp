@@ -51,6 +51,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #ifdef _WIN32
 #define WIN32_NO_STATUS
 #include <Windows.h>
@@ -72,6 +73,7 @@
 #include "core/inc/amd_gpu_pm4.h"
 #include "core/inc/hsa_amd_tool_int.hpp"
 #include "core/inc/amd_core_dump.hpp"
+#include "loader/AMDHSAKernelDescriptor.h"
 
 namespace rocr {
 namespace AMD {
@@ -968,8 +970,8 @@ void AqlQueue::AsyncReclaimAltScratch() {
   return;
 }
 
-void AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
-                                         hsa_signal_value_t& waitVal, bool& changeWait) {
+hsa_status_t AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
+                                                 hsa_signal_value_t& waitVal, bool& changeWait) {
   // Insufficient scratch - recoverable, don't process dynamic scratch if errors are present.
   auto& scratch = queue_scratch_;
 
@@ -1032,6 +1034,42 @@ void AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
 
 
   auto get_dispatch_pkt = [&]() {
+    auto private_segment_size_from_kernel_descriptor = [](const core::AqlPacket* dispatch_pkt) {
+      if (dispatch_pkt->dispatch.kernel_object == 0) return uint32_t{0};
+
+      const auto* kd =
+          reinterpret_cast<const rocr::llvm::amdhsa::kernel_descriptor_t*>(
+              dispatch_pkt->dispatch.kernel_object);
+      const bool enables_private_segment =
+          AMDHSA_BITS_GET(kd->compute_pgm_rsrc2,
+                          rocr::llvm::amdhsa::COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT) != 0;
+      return enables_private_segment ? kd->private_segment_fixed_size : uint32_t{0};
+    };
+
+    auto dispatch_needs_scratch = [&](core::AqlPacket* dispatch_pkt) {
+      const uint16_t header = dispatch_pkt->packet.header;
+      if (!core::AqlPacket::IsValid(header) ||
+          core::AqlPacket::type(header) != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
+        return false;
+      }
+
+      const uint32_t descriptor_private_segment_size =
+          private_segment_size_from_kernel_descriptor(dispatch_pkt);
+      if (descriptor_private_segment_size > dispatch_pkt->dispatch.private_segment_size) {
+        const char* debug_scratch = std::getenv("HSA_SCRATCH_DEBUG");
+        if (debug_scratch && debug_scratch[0]) {
+          fprintf(stderr,
+                  "rocr: correcting dispatch private_segment_size from %u to kernel descriptor "
+                  "private_segment_fixed_size %u (kernel_object=0x%llx)\n",
+                  dispatch_pkt->dispatch.private_segment_size, descriptor_private_segment_size,
+                  static_cast<unsigned long long>(dispatch_pkt->dispatch.kernel_object));
+        }
+        dispatch_pkt->dispatch.private_segment_size = descriptor_private_segment_size;
+      }
+
+      return dispatch_pkt->IsDispatchAndNeedsScratch();
+    };
+
     dispatch_id = amd_queue_.read_dispatch_id;
     do {
       // On GPUs where EOP is handled in asic, the read_dispatch_id is not
@@ -1042,9 +1080,7 @@ void AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
 
       core::AqlPacket *dispatch_pkt =
           &((core::AqlPacket *)amd_queue_.hsa_queue.base_address)[pkt_slot_idx];
-
-      if (dispatch_pkt->IsDispatchAndNeedsScratch())
-        return dispatch_pkt;
+      if (dispatch_needs_scratch(dispatch_pkt)) return dispatch_pkt;
 
       dispatch_id++;
     } while (dispatch_id <= LoadWriteIndexRelaxed());
@@ -1114,8 +1150,30 @@ void AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
   scratch.cooperative = (amd_queue_.hsa_queue.type == HSA_QUEUE_TYPE_COOPERATIVE);
 
   pkt = get_dispatch_pkt(); // Sets dispatch_id
-  assert((pkt && dispatch_id != UINT64_MAX) &&
-         "Could not find dispatch packet with private_segment_size > 0");
+  if (pkt == nullptr || dispatch_id == UINT64_MAX) {
+    const uint64_t read_dispatch_id = amd_queue_.read_dispatch_id;
+    const uint64_t write_dispatch_id = LoadWriteIndexRelaxed();
+    fprintf(stderr,
+            "rocr: insufficient scratch event 0x%llx but no dispatch packet with "
+            "private_segment_size > 0 was visible (queue=%p read_dispatch_id=%llu "
+            "write_dispatch_id=%llu queue_size=%u)\n",
+            static_cast<unsigned long long>(error_code), static_cast<void*>(this),
+            static_cast<unsigned long long>(read_dispatch_id),
+            static_cast<unsigned long long>(write_dispatch_id), amd_queue_.hsa_queue.size);
+
+    const uint64_t scan_begin = read_dispatch_id;
+    const uint64_t scan_end = std::min<uint64_t>(
+        write_dispatch_id, read_dispatch_id + std::min<uint64_t>(amd_queue_.hsa_queue.size, 8) - 1);
+    for (uint64_t id = scan_begin; id <= scan_end; ++id) {
+      const uint64_t pkt_slot_idx = id & (amd_queue_.hsa_queue.size - 1);
+      const core::AqlPacket* visible_pkt =
+          &((const core::AqlPacket*)amd_queue_.hsa_queue.base_address)[pkt_slot_idx];
+      fprintf(stderr, "rocr: scratch scan packet dispatch_id=%llu slot=%llu\n%s\n",
+              static_cast<unsigned long long>(id),
+              static_cast<unsigned long long>(pkt_slot_idx), visible_pkt->string().c_str());
+    }
+    return HSA_STATUS_ERROR_INVALID_PACKET_FORMAT;
+  }
 
   tool::notify_event_scratch_alloc_start(
       public_handle(), HSA_AMD_EVENT_SCRATCH_ALLOC_FLAG_NONE, dispatch_id);
@@ -1170,7 +1228,7 @@ void AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
       HSA::hsa_signal_store_screlease(amd_queue_.queue_inactive_signal, 0);
       tool::notify_event_scratch_alloc_end(public_handle(), HSA_AMD_EVENT_SCRATCH_ALLOC_FLAG_ALT,
                                            dispatch_id, scratch.alt_size, dispatch_slots);
-      return;
+      return HSA_STATUS_SUCCESS;
     }
     // Could not allocate enough memory for alternate scratch fallback to primary scratch
     scratch.alt_size = 0;
@@ -1204,7 +1262,7 @@ void AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
     // We could not allocate memory to fit even 1 wave
     tool::notify_event_scratch_alloc_end(public_handle(), HSA_AMD_EVENT_SCRATCH_ALLOC_FLAG_USE_ONCE,
                                          dispatch_id, scratch.main_size, dispatch_slots);
-    return;
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
   }
 
   // If we had to reduce number of waves
@@ -1246,7 +1304,7 @@ void AqlQueue::HandleInsufficientScratch(hsa_signal_value_t& error_code,
   tool::notify_event_scratch_alloc_end(public_handle(), alloc_flag, dispatch_id, scratch.main_size,
                                        dispatch_slots);
 
-  return;
+  return HSA_STATUS_SUCCESS;
 }
 
 template <bool HandleExceptions>
@@ -1292,10 +1350,11 @@ bool AqlQueue::DynamicQueueEventsHandler(hsa_signal_value_t error_code, void* ar
 
     // Process only one queue error.
     if (error_code & 0x401) {  // insufficient scratch, wave64 or wave32
-      queue->HandleInsufficientScratch(error_code, waitVal, changeWait);
+      errorCode = queue->HandleInsufficientScratch(error_code, waitVal, changeWait);
 
       // Out of scratch - promote error
-      if (queue->queue_scratch_.main_queue_base == nullptr &&
+      if (errorCode == HSA_STATUS_SUCCESS &&
+          queue->queue_scratch_.main_queue_base == nullptr &&
           queue->queue_scratch_.alt_queue_base == nullptr)
         errorCode = HSA_STATUS_ERROR_OUT_OF_RESOURCES;
 

@@ -254,6 +254,16 @@ set ( SRCS core/driver/driver.cpp
            libamdhsacode/amd_options.cpp
            libamdhsacode/amd_hsa_code.cpp)
 
+## Optional: HotSwap load-time ISA translation through COMGR.
+option(ROCR_ENABLE_HOTSWAP_COMGR_ADAPTER
+  "Enable ROCr loader integration with COMGR HotSwap transpilation" OFF)
+if(ROCR_ENABLE_HOTSWAP_COMGR_ADAPTER)
+  find_package(amd_comgr REQUIRED CONFIG)
+  target_link_libraries(${CORE_RUNTIME_TARGET} PRIVATE amd_comgr)
+  target_compile_definitions(${CORE_RUNTIME_TARGET} PRIVATE
+    ROCR_HOTSWAP_COMGR_ADAPTER=1)
+endif()
+
 if(UNIX)
   set(SRC_OS core/util/lnx/os_linux.cpp
 	     libamdhsacode/lnx/amd_core_dump.cpp)
