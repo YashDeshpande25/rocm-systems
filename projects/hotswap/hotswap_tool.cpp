@@ -442,7 +442,9 @@ bool agent_is_gfx1250_a0(hsa_agent_t agent) {
   }
 
   bool result = false;
-  if (get_agent_isa_name(agent).find("gfx1250") != std::string::npos) {
+  const std::string isa_name = get_agent_isa_name(agent);
+  int chip_rev = -1;
+  if (isa_name.find("gfx1250") != std::string::npos) {
     uint32_t kfd_node_id = 0;
     if (hsa_agent_get_info(
             agent,
@@ -450,10 +452,14 @@ bool agent_is_gfx1250_a0(hsa_agent_t agent) {
             &kfd_node_id) == HSA_STATUS_SUCCESS) {
       const int render_minor = read_drm_render_minor(kfd_node_id);
       if (render_minor >= 0) {
-        result = (query_chip_rev(render_minor) == 0);  // A0
+        chip_rev = query_chip_rev(render_minor);
+        result = (chip_rev == 0);  // A0
       }
     }
   }
+
+  fprintf(stderr, "hotswap: agent isa=%s chip_rev=%d -> gfx1250_A0=%s\n",
+          isa_name.c_str(), chip_rev, result ? "yes" : "no");
 
   {
     std::scoped_lock lock(cache_mutex);
