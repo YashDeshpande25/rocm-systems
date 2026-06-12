@@ -372,15 +372,21 @@ std::string get_agent_isa_name(hsa_agent_t agent) {
 }
 
 #if defined(__linux__)
+// Base directories that contain KFD topology node subdirectories. Exposed as a
+// mutable reference (rather than a hard-coded array) so unit tests can redirect
+// the sysfs parsing at a temporary directory without real hardware.
+std::vector<std::string> &topology_node_base_dirs() {
+  static std::vector<std::string> dirs = {
+      "/sys/devices/virtual/kfd/kfd/topology/nodes/",
+      "/sys/class/kfd/kfd/topology/nodes/"};
+  return dirs;
+}
+
 // Reads the DRM render minor for the given KFD topology node by parsing
 // /sys/devices/virtual/kfd/kfd/topology/nodes/<node>/properties (lines of the
 // form "<key> <value>"). Returns -1 on failure.
 int read_drm_render_minor(uint32_t kfd_node_id) {
-  static const char *const kTopologyDirs[] = {
-      "/sys/devices/virtual/kfd/kfd/topology/nodes/",
-      "/sys/class/kfd/kfd/topology/nodes/"};
-
-  for (const char *dir : kTopologyDirs) {
+  for (const std::string &dir : topology_node_base_dirs()) {
     std::ifstream props(dir + std::to_string(kfd_node_id) + "/properties");
     if (!props) {
       continue;
@@ -413,7 +419,7 @@ int query_chip_rev(int render_minor) {
     drm_amdgpu_info_device dev_info = {};
     if (amdgpu_query_info(dev, AMDGPU_INFO_DEV_INFO, sizeof(dev_info),
                           &dev_info) == 0) {
-      chip_rev = static_cast<int>(dev_info.chip_rev);
+      chip_rev = static_cast<int>(dev_info.pci_rev);
     }
     amdgpu_device_deinitialize(dev);
   }
